@@ -4,43 +4,81 @@ import numpy as np
 class VolatilityManager:
     def __init__(self, filepath):
         print(f"Loading Volatility Surface: {filepath}")
-        # Carichiamo tutto in memoria (assumiamo che il file processato sia leggero)
+        
+        # 1. LETTURA PARQUET
         self.df = pd.read_parquet(filepath)
-        # Assicuriamoci che sia ordinato per una ricerca veloce
-        self.df = self.df.sort_values(by=['AsOfDate', 'Expiry', 'Strike'])
+        
+        # 2. NORMALIZZAZIONE NOMI COLONNE
+        rename_map = {
+            'Expiry': 'expiry_date',
+            'Strike': 'strike',
+            'IV': 'iv',
+            'Moneyness': 'moneyness'
+        }
+        self.df = self.df.rename(columns=rename_map)
+        
+        # 3. CONVERSIONE DATE
+        self.df['AsOfDate'] = pd.to_datetime(self.df['AsOfDate'])
+        self.df['expiry_date'] = pd.to_datetime(self.df['expiry_date'])
+        
+        # 4. INDICIZZAZIONE
+        self.df = self.df.sort_values(by=['AsOfDate', 'expiry_date', 'strike'])
+        self.df.set_index(['AsOfDate', 'expiry_date'], inplace=True)
+        self.df = self.df.sort_index()
+        
+        print(f"   Volatilità caricata. Date: da {self.df.index.levels[0].min().date()} a {self.df.index.levels[0].max().date()}")
 
-    def get_interpolated_iv(self, current_date, expiry_date, moneyness):
+    def get_interpolated_iv(self, current_date, expiry_date, target_strike):
         """
-        Questa è una versione semplificata. 
-        Nel mondo reale qui useremmo un interpolatore cubico pre-calcolato.
-        Qui facciamo un lookup "Nearest" per far girare il codice inizialmente.
+        Cerca la IV corretta sulla superficie statica del giorno.
+        Usa argmin sui valori per evitare ambiguità di indici duplicati.
         """
-        # Filtra per data e scadenza
-        # NOTA: Qui dovrai adattare i nomi colonne se diversi (es. 'Moneyness', 'IV')
         try:
-            # Esempio di logica placeholder - da sostituire con la tua interpolazione precisa
-            # Se hai già una colonna IV interpolata nel parquet, la usiamo.
-            # Altrimenti ritorniamo una vol fissa per testare il codice (0.20)
-            # Fino a che non colleghiamo l'interpolatore preciso scritto in 'interpolazione.py'
-            return 0.20 
-        except:
-            return 0.20
+            # 1. Seleziona la 'fetta' di oggi per quella scadenza
+            subset = self.df.loc[(current_date, expiry_date)]
+            
+            # 2. Trova la POSIZIONE (0, 1, 2...) dello strike più vicino
+            # .values converte in array NumPy, .argmin() ci dà l'intero posizionale
+            pos_nearest = (subset['strike'] - target_strike).abs().values.argmin()
+            
+            # 3. Restituisci la IV usando la posizione (.iloc)
+            return subset.iloc[pos_nearest]['iv']
+            
+        except KeyError:
+            return None
+        except Exception:
+            return None
 
 class RatesManager:
     def __init__(self, filepath):
         print(f"Loading Rates: {filepath}")
         self.df = pd.read_parquet(filepath)
+        self.df['AsOfDate'] = pd.to_datetime(self.df['AsOfDate'])
+        self.df = self.df.set_index('AsOfDate').sort_index()
     
-    def get_risk_free_rate(self, date, tenor_years):
-        # Placeholder: Ritorna il tasso Euribor medio se non trova la data
-        return 0.03
+    def get_risk_free_rate(self, date, tenor_days):
+        try:
+            curve = self.df.loc[date]
+            if not isinstance(curve, pd.Series): 
+                return np.interp(tenor_days, curve['tau_days'], curve['r'])
+            else:
+                return curve['r']
+        except:
+            return 0.03
 
 class DividendsManager:
     def __init__(self, filepath):
         print(f"Loading Dividends: {filepath}")
         self.df = pd.read_parquet(filepath)
+        self.df['AsOfDate'] = pd.to_datetime(self.df['AsOfDate'])
+        self.df = self.df.set_index('AsOfDate').sort_index()
         
-    def get_pv_dividends(self, current_date, expiry_date, r):
-        # Filtra i dividendi che cadono tra oggi e scadenza
-        # Calcola il valore attuale: D * e^(-r * t)
-        return 0.0 # Placeholder per far partire il loop
+        if 'q' in self.df.columns:
+            self.df['q'] = self.df['q'].replace(0.0, np.nan).ffill()
+
+    def get_yield_q(self, date):
+        try:
+            idx = self.df.index.get_indexer([date], method='ffill')[0]
+            return self.df.iloc[idx]['q'] if idx != -1 else 0.03
+        except:
+            return 0.03
